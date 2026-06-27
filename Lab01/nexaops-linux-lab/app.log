@@ -1,0 +1,11 @@
+2024-01-15 07:00:01 INFO  App started successfully
+2024-01-15 07:01:03 INFO  Connected to database
+2024-01-15 07:02:11 WARN  Response time above threshold: 850ms
+2024-01-15 07:03:44 ERROR Failed to write to disk: permission denied
+2024-01-15 07:04:02 INFO  Retry attempt 1 of 3
+2024-01-15 07:04:30 INFO  Retry attempt 2 of 3
+2024-01-15 07:05:18 ERROR Database connection lost: timeout after 30s
+2024-01-15 07:06:30 ERROR Timeout on payment service: no response
+2024-01-15 07:07:01 WARN  Falling back to cached data
+2024-01-15 07:07:45 INFO  Service partially recovered
+2024-01-15 07:08:12 INFO  All systems nominal
