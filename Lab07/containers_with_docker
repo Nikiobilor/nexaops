@@ -1,0 +1,2061 @@
+# NXOPS-007 — Containers with Docker
+### NexaOps DevOps Bootcamp · Module 7 · Foundation Track
+
+> **Scenario:** NexaOps Ltd is tired of hearing "it works on my machine." Three developers are running different OS versions, different Python versions, and different dependency sets. Every deployment to the server involves hours of environment debugging. Your engineering manager has raised a ticket: containerise the NexaOps internal dashboard application using Docker so it runs identically on every developer's machine, on the CI server, and in production. You will develop locally on WSL and then ship the same image to an EC2 instance — proving the container runs identically everywhere.
+
+---
+
+## Table of Contents
+
+1. [How to use this lab](#1-how-to-use-this-lab)
+2. [Prerequisites](#2-prerequisites)
+3. [The application — NexaOps Internal Dashboard](#3-the-application--nexaops-internal-dashboard)
+4. [Task 1 — Docker fundamentals: images, containers, and the daemon](#4-task-1--docker-fundamentals-images-containers-and-the-daemon)
+5. [Task 2 — Write a production-grade Dockerfile](#5-task-2--write-a-production-grade-dockerfile)
+6. [Task 3 — Docker networking and volumes](#6-task-3--docker-networking-and-volumes)
+7. [Task 4 — Docker Compose: multi-container application](#7-task-4--docker-compose-multi-container-application)
+8. [Task 5 — Ship to production: EC2 deployment](#8-task-5--ship-to-production-ec2-deployment)
+9. [Document your work — commands.md](#9-document-your-work--commandsmd)
+10. [Push to GitHub](#10-push-to-github)
+11. [Acceptance criteria checklist](#11-acceptance-criteria-checklist)
+12. [Tear-down checklist](#12-tear-down-checklist)
+13. [LinkedIn post template](#13-linkedin-post-template)
+14. [Interview questions](#14-interview-questions--5-scenario-based-questions)
+15. [Troubleshooting](#15-troubleshooting)
+16. [What you learned](#16-what-you-learned)
+
+---
+
+## 1. How to use this lab
+
+This lab has **5 tasks** that build on each other in sequence.
+
+| Task | Topic | What you build | Interview topic |
+|---|---|---|---|
+| Task 1 | Fundamentals | Pull, run, inspect containers | "Explain how Docker works" |
+| Task 2 | Dockerfile | Multi-stage production Dockerfile | "Write me a Dockerfile for this app" |
+| Task 3 | Networking & volumes | Bridge networks, bind mounts, named volumes | "How do containers communicate?" |
+| Task 4 | Docker Compose | Multi-container app with a database | "How do you run a multi-service app locally?" |
+| Task 5 | Production deploy | Push to Docker Hub, deploy on EC2 | "How does an image get from dev to production?" |
+
+**The journey of an image in this lab:**
+
+```
+Write Dockerfile (WSL)
+       ↓
+Build image locally (WSL)
+       ↓
+Test container locally (WSL)
+       ↓
+Push to Docker Hub
+       ↓
+Pull and run on EC2 (production simulation)
+       ↓
+Prove identical behaviour in both environments
+```
+
+---
+
+## 2. Prerequisites
+
+### Local — WSL (Ubuntu 22.04)
+
+```bash
+# Install Docker
+curl -fsSL https://get.docker.com | sudo sh
+
+# Add your user to the docker group (no sudo needed)
+sudo usermod -aG docker $USER
+
+# Apply without logging out
+newgrp docker
+
+# Verify
+docker --version
+docker run hello-world
+```
+
+### Install Docker Compose
+
+```bash
+# Docker Compose v2 (plugin syntax: docker compose not docker-compose)
+sudo apt-get install -y docker-compose-plugin
+
+# Verify
+docker compose version
+```
+
+### Docker Hub account
+
+Create a free account at https://hub.docker.com if you do not have one. Your images will be pushed to `docker.io/<YOUR_DOCKERHUB_USERNAME>/`.
+
+```bash
+# Login from terminal
+docker login
+# Enter your Docker Hub username and password
+```
+
+### EC2 instance (for Task 5)
+
+A t3.micro Ubuntu 22.04 instance is sufficient — Docker is lightweight. You will set this up in Task 5. Keep it terminated until then.
+
+### Create your lab folder
+
+```bash
+mkdir -p ~/nexaops-docker-lab
+cd ~/nexaops-docker-lab
+git init
+git config user.name "Your Name"
+git config user.email "your@email.com"
+```
+
+---
+
+## 3. The Application — NexaOps Internal Dashboard
+
+You are containerising the **NexaOps Internal Dashboard** — a lightweight Flask web application that shows the status of internal services, recent deployments, and team activity. It uses:
+
+- **Flask** (Python web framework) — the dashboard backend
+- **Redis** — caches the dashboard data so it does not hit the database on every request
+- **PostgreSQL** — stores deployment history and team activity
+
+This is a realistic three-tier application: web → cache → database. All three will run as separate containers connected via a Docker network.
+
+### Create the application files
+
+```bash
+mkdir -p ~/nexaops-docker-lab/dashboard/app
+mkdir -p ~/nexaops-docker-lab/dashboard/templates
+mkdir -p ~/nexaops-docker-lab/dashboard/static
+cd ~/nexaops-docker-lab/dashboard
+```
+
+**File 1 — `app/main.py`**
+
+```bash
+cat > app/main.py << 'EOF'
+"""
+NexaOps Internal Dashboard v1.0.0
+Flask application showing service status, deployments, and team activity.
+"""
+
+import os
+import json
+import redis
+import psycopg2
+from datetime import datetime
+from flask import Flask, jsonify, render_template
+
+app = Flask(__name__, template_folder="../templates", static_folder="../static")
+
+# ── Config ────────────────────────────────────────────────────────────────────
+REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
+REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
+DB_HOST    = os.getenv("DB_HOST", "localhost")
+DB_PORT    = int(os.getenv("DB_PORT", 5432))
+DB_NAME    = os.getenv("DB_NAME", "nexaops")
+DB_USER    = os.getenv("DB_USER", "nexaops")
+DB_PASS    = os.getenv("DB_PASSWORD", "nexaops")
+APP_VERSION = os.getenv("APP_VERSION", "1.0.0")
+ENVIRONMENT = os.getenv("ENVIRONMENT", "development")
+
+
+def get_redis():
+    """Return a Redis connection or None if unavailable."""
+    try:
+        r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT,
+                        decode_responses=True, socket_connect_timeout=2)
+        r.ping()
+        return r
+    except Exception:
+        return None
+
+
+def get_db():
+    """Return a PostgreSQL connection or None if unavailable."""
+    try:
+        return psycopg2.connect(
+            host=DB_HOST, port=DB_PORT,
+            dbname=DB_NAME, user=DB_USER, password=DB_PASS,
+            connect_timeout=3
+        )
+    except Exception:
+        return None
+
+
+def get_services():
+    """Return service status — from Redis cache or defaults."""
+    r = get_redis()
+    if r:
+        cached = r.get("nexaops:services")
+        if cached:
+            return json.loads(cached)
+
+    services = [
+        {"name": "API Gateway",            "status": "operational", "uptime": "99.98%"},
+        {"name": "Authentication Service", "status": "operational", "uptime": "99.95%"},
+        {"name": "Database Cluster",       "status": "operational", "uptime": "99.99%"},
+        {"name": "Payment Service",        "status": "degraded",    "uptime": "98.21%"},
+        {"name": "Notification Service",   "status": "operational", "uptime": "99.87%"},
+        {"name": "File Storage",           "status": "operational", "uptime": "99.94%"},
+    ]
+
+    if r:
+        r.setex("nexaops:services", 30, json.dumps(services))
+
+    return services
+
+
+def get_deployments():
+    """Return recent deployments from PostgreSQL or seed data."""
+    conn = get_db()
+    if conn:
+        try:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT service, version, status, deployed_by, deployed_at
+                FROM deployments
+                ORDER BY deployed_at DESC
+                LIMIT 5
+            """)
+            rows = cur.fetchall()
+            conn.close()
+            return [
+                {"service": r[0], "version": r[1], "status": r[2],
+                 "deployed_by": r[3], "deployed_at": str(r[4])}
+                for r in rows
+            ]
+        except Exception:
+            conn.close()
+
+    return [
+        {"service": "user-service",         "version": "1.2.0", "status": "success",
+         "deployed_by": "engineer-a", "deployed_at": "2024-01-15 09:32 UTC"},
+        {"service": "notification-service", "version": "2.1.1", "status": "success",
+         "deployed_by": "engineer-b", "deployed_at": "2024-01-15 08:15 UTC"},
+        {"service": "payment-service",      "version": "3.0.1", "status": "failed",
+         "deployed_by": "engineer-c", "deployed_at": "2024-01-14 16:44 UTC"},
+    ]
+
+
+# ── Routes ────────────────────────────────────────────────────────────────────
+
+@app.route("/")
+def index():
+    services    = get_services()
+    deployments = get_deployments()
+    operational = sum(1 for s in services if s["status"] == "operational")
+    return render_template("index.html",
+        services=services,
+        deployments=deployments,
+        operational=operational,
+        total=len(services),
+        version=APP_VERSION,
+        environment=ENVIRONMENT,
+        timestamp=datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+    )
+
+
+@app.route("/health")
+def health():
+    redis_ok = get_redis() is not None
+    db_ok    = get_db()    is not None
+    return jsonify({
+        "status":      "healthy",
+        "version":     APP_VERSION,
+        "environment": ENVIRONMENT,
+        "checks": {
+            "redis":    "connected" if redis_ok else "unavailable",
+            "database": "connected" if db_ok    else "unavailable"
+        }
+    }), 200
+
+
+@app.route("/api/services")
+def api_services():
+    return jsonify(get_services())
+
+
+@app.route("/api/deployments")
+def api_deployments():
+    return jsonify(get_deployments())
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000, debug=False)
+EOF
+```
+
+**File 2 — `templates/index.html`**
+
+```bash
+cat > templates/index.html << 'EOF'
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>NexaOps Internal Dashboard</title>
+  <style>
+    *{box-sizing:border-box;margin:0;padding:0}
+    body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0f1117;color:#e2e8f0;min-height:100vh}
+    header{background:#1a1f2e;border-bottom:1px solid #2d3748;padding:1rem 2rem;display:flex;justify-content:space-between;align-items:center}
+    header h1{font-size:1.2rem;font-weight:600;color:#63b3ed}
+    .meta{font-size:0.75rem;color:#718096}
+    .env-badge{background:#2d3748;padding:2px 10px;border-radius:20px;font-size:0.7rem;font-weight:600;text-transform:uppercase;letter-spacing:0.05em;color:#a0aec0;margin-left:8px}
+    main{max-width:900px;margin:2rem auto;padding:0 1rem;display:grid;gap:1.5rem}
+    .summary{display:grid;grid-template-columns:repeat(3,1fr);gap:1rem}
+    .stat-card{background:#1a1f2e;border:1px solid #2d3748;border-radius:8px;padding:1.2rem;text-align:center}
+    .stat-num{font-size:2rem;font-weight:700;color:#63b3ed}
+    .stat-label{font-size:0.75rem;color:#718096;margin-top:4px;text-transform:uppercase;letter-spacing:0.05em}
+    .card{background:#1a1f2e;border:1px solid #2d3748;border-radius:8px;overflow:hidden}
+    .card-header{padding:0.9rem 1.2rem;border-bottom:1px solid #2d3748;display:flex;justify-content:space-between;align-items:center}
+    .card-header h2{font-size:0.85rem;font-weight:600;text-transform:uppercase;letter-spacing:0.05em;color:#a0aec0}
+    .service-row{display:flex;justify-content:space-between;align-items:center;padding:0.8rem 1.2rem;border-bottom:1px solid #1e2533}
+    .service-row:last-child{border-bottom:none}
+    .service-name{font-size:0.9rem}
+    .badge{font-size:0.65rem;font-weight:700;padding:3px 10px;border-radius:20px;text-transform:uppercase;letter-spacing:0.05em}
+    .badge.operational{background:#1c4532;color:#68d391}
+    .badge.degraded{background:#5c3317;color:#f6ad55}
+    .badge.outage{background:#521b1b;color:#fc8181}
+    .uptime{font-size:0.75rem;color:#718096;margin-right:1rem}
+    .deploy-row{display:grid;grid-template-columns:1fr auto auto auto;gap:1rem;align-items:center;padding:0.8rem 1.2rem;border-bottom:1px solid #1e2533;font-size:0.85rem}
+    .deploy-row:last-child{border-bottom:none}
+    .deploy-service{font-weight:500}
+    .deploy-version{color:#63b3ed;font-family:monospace;font-size:0.8rem}
+    .deploy-by{color:#718096;font-size:0.75rem}
+    .badge.success{background:#1c4532;color:#68d391}
+    .badge.failed{background:#521b1b;color:#fc8181}
+    footer{text-align:center;padding:2rem;color:#4a5568;font-size:0.75rem}
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>NexaOps Internal Dashboard</h1>
+      <span class="env-badge">{{ environment }}</span>
+    </div>
+    <div class="meta">v{{ version }} &nbsp;|&nbsp; {{ timestamp }}</div>
+  </header>
+  <main>
+    <div class="summary">
+      <div class="stat-card">
+        <div class="stat-num">{{ operational }}/{{ total }}</div>
+        <div class="stat-label">Services Operational</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-num">{{ deployments|length }}</div>
+        <div class="stat-label">Recent Deployments</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-num">{{ "99.6" }}%</div>
+        <div class="stat-label">Overall Uptime (30d)</div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-header"><h2>Service Status</h2></div>
+      {% for s in services %}
+      <div class="service-row">
+        <span class="service-name">{{ s.name }}</span>
+        <div style="display:flex;align-items:center">
+          <span class="uptime">{{ s.uptime }}</span>
+          <span class="badge {{ s.status }}">{{ s.status }}</span>
+        </div>
+      </div>
+      {% endfor %}
+    </div>
+    <div class="card">
+      <div class="card-header"><h2>Recent Deployments</h2></div>
+      {% for d in deployments %}
+      <div class="deploy-row">
+        <span class="deploy-service">{{ d.service }}</span>
+        <span class="deploy-version">{{ d.version }}</span>
+        <span class="deploy-by">{{ d.deployed_by }}</span>
+        <span class="badge {{ d.status }}">{{ d.status }}</span>
+      </div>
+      {% endfor %}
+    </div>
+  </main>
+  <footer>NexaOps Ltd &mdash; Internal use only</footer>
+</body>
+</html>
+EOF
+```
+
+**File 3 — `requirements.txt`**
+
+```bash
+cat > requirements.txt << 'EOF'
+flask==3.0.0
+redis==5.0.1
+psycopg2-binary==2.9.9
+gunicorn==21.2.0
+EOF
+```
+
+**File 4 — `init.sql`** (database seed)
+
+```bash
+cat > init.sql << 'EOF'
+-- NexaOps Dashboard Database Schema
+CREATE TABLE IF NOT EXISTS deployments (
+    id          SERIAL PRIMARY KEY,
+    service     VARCHAR(100) NOT NULL,
+    version     VARCHAR(50)  NOT NULL,
+    status      VARCHAR(20)  NOT NULL,
+    deployed_by VARCHAR(100) NOT NULL,
+    deployed_at TIMESTAMP    DEFAULT NOW()
+);
+
+INSERT INTO deployments (service, version, status, deployed_by) VALUES
+    ('user-service',         '1.2.0', 'success', 'engineer-a'),
+    ('notification-service', '2.1.1', 'success', 'engineer-b'),
+    ('payment-service',      '3.0.1', 'failed',  'engineer-c'),
+    ('api-gateway',          '4.5.0', 'success', 'engineer-a'),
+    ('report-service',       '1.0.2', 'success', 'engineer-b');
+EOF
+```
+
+---
+
+## 4. Task 1 — Docker Fundamentals: Images, Containers, and the Daemon
+
+### Scenario
+
+Before writing a single Dockerfile, you need to understand exactly how Docker works under the hood. Your team lead asks you to demonstrate that you can pull, run, inspect, and manage containers before containerising the NexaOps dashboard.
+
+### Questions to answer before you look at the steps
+
+- What is the difference between a Docker image and a container?
+- What is the Docker daemon and what does it do?
+- What happens when you run `docker run ubuntu`?
+- What is a container registry?
+- What does it mean for a container to be ephemeral?
+
+---
+
+### Step 1 — Understand the Docker architecture
+
+```
+Your Terminal (docker CLI)
+         │
+         │ REST API calls
+         ▼
+Docker Daemon (dockerd)
+         │
+         ├── Manages images (stored in /var/lib/docker)
+         ├── Manages containers (running/stopped)
+         ├── Manages networks
+         └── Manages volumes
+                  │
+                  │ pull/push
+                  ▼
+         Docker Hub / Registry
+         (docker.io, ghcr.io, ECR)
+```
+
+```bash
+# Verify the daemon is running
+sudo systemctl status docker
+
+# The daemon socket
+ls -la /var/run/docker.sock
+
+# Docker system info — shows daemon configuration
+docker info
+
+# Docker version — client and server
+docker version
+```
+
+---
+
+### Step 2 — Pull and inspect images
+
+```bash
+# Pull an image from Docker Hub
+docker pull nginx:1.25-alpine
+
+# List images on your machine
+docker images
+
+# Inspect the image metadata
+docker inspect nginx:1.25-alpine
+
+# See the image layers
+docker history nginx:1.25-alpine
+
+# See image size
+docker images nginx:1.25-alpine --format "table {{.Repository}}\t{{.Tag}}\t{{.Size}}"
+
+# Pull specific version vs latest
+docker pull python:3.11-slim
+docker pull python:3.11-alpine
+
+# Compare sizes
+docker images python --format "table {{.Repository}}\t{{.Tag}}\t{{.Size}}"
+```
+
+---
+
+### Step 3 — Run your first containers
+
+```bash
+# Run a container interactively (-it = interactive terminal)
+docker run -it ubuntu:22.04 bash
+
+# Inside the container:
+whoami           # root
+hostname         # container ID
+ls /             # filesystem
+cat /etc/os-release
+exit             # back to your host
+
+# Run in background (-d = detached)
+docker run -d --name nexaops-nginx -p 8080:80 nginx:1.25-alpine
+
+# Verify it is running
+docker ps
+
+# Hit the nginx server
+curl http://localhost:8080
+
+# See logs
+docker logs nexaops-nginx
+
+# Follow logs in real time
+docker logs -f nexaops-nginx
+```
+
+---
+
+### Step 4 — Understand container lifecycle
+
+```bash
+# List running containers
+docker ps
+
+# List ALL containers including stopped
+docker ps -a
+
+# Stop a container (sends SIGTERM, waits, then SIGKILL)
+docker stop nexaops-nginx
+
+# Start it again
+docker start nexaops-nginx
+
+# Pause a container (freezes the process)
+docker pause nexaops-nginx
+
+# Unpause
+docker unpause nexaops-nginx
+
+# Execute a command in a running container
+docker exec -it nexaops-nginx sh
+# Inside: ls /etc/nginx/  then exit
+
+# Remove a container (must be stopped first)
+docker stop nexaops-nginx
+docker rm nexaops-nginx
+
+# Force remove a running container
+docker rm -f nexaops-nginx
+
+# Verify it is gone
+docker ps -a
+```
+
+---
+
+### Step 5 — Prove containers are ephemeral
+
+```bash
+# Run a container and create a file inside it
+docker run -it --name ephemeral-test ubuntu:22.04 bash
+# Inside the container:
+echo "This data will disappear" > /tmp/nexaops-data.txt
+cat /tmp/nexaops-data.txt
+exit
+
+# The container is stopped but still exists
+docker ps -a | grep ephemeral-test
+
+# Remove it
+docker rm ephemeral-test
+
+# Run a new container — the file is gone
+docker run -it ubuntu:22.04 bash
+cat /tmp/nexaops-data.txt  # No such file or directory
+exit
+docker rm $(docker ps -aq --filter ancestor=ubuntu:22.04)
+```
+
+This is the core principle: **containers are ephemeral**. Any data written inside a container is lost when the container is removed. Volumes (Task 3) solve this for persistent data.
+
+---
+
+### Step 6 — Clean up
+
+```bash
+# Remove all stopped containers
+docker container prune
+
+# Remove unused images
+docker image prune
+
+# Remove everything unused (containers, networks, images, build cache)
+docker system prune
+
+# See disk usage
+docker system df
+```
+
+---
+
+### ✅ Task 1 — Answers
+
+**Image vs container?**
+An image is a read-only template — a packaged snapshot of a filesystem and its metadata (OS, app code, dependencies, config). A container is a running instance of an image — it adds a thin writable layer on top of the image layers. You can run many containers from the same image simultaneously. The image never changes; the container's writable layer is temporary.
+
+**What is the Docker daemon?**
+A background service (`dockerd`) that does all the real work — managing images, starting/stopping containers, handling networking, and managing volumes. The `docker` CLI you type commands into is just a client that sends API requests to the daemon over a Unix socket (`/var/run/docker.sock`). The daemon can run on a remote machine — the CLI just needs the socket address.
+
+**What happens when you run `docker run ubuntu`?**
+Docker checks if the `ubuntu` image exists locally. If not, it pulls it from Docker Hub. It creates a new container from the image, starts the process specified in the image's CMD instruction, and attaches your terminal if `-it` was specified. When the process exits, the container stops.
+
+**What is a container registry?**
+A server that stores and distributes Docker images. Docker Hub is the default public registry. Others include AWS ECR, GitHub Container Registry (ghcr.io), and Google Artifact Registry. You push images to a registry so other machines can pull them.
+
+**What does ephemeral mean for containers?**
+Containers are designed to be temporary. Any data written inside a container's filesystem is lost when the container is removed. This is intentional — it forces a clean-slate approach and prevents configuration drift. Persistent data belongs in volumes, not in containers.
+
+---
+
+## 5. Task 2 — Write a Production-grade Dockerfile
+
+### Scenario
+
+Your team lead reviews a junior engineer's Dockerfile and rejects it — it runs as root, installs unnecessary packages, has secrets baked in, and produces a 1.2GB image. Your job is to write a production-grade Dockerfile for the NexaOps dashboard that is lean, secure, and follows best practices.
+
+### Questions to answer before you look at the steps
+
+- What is a Dockerfile instruction and how does each one create a layer?
+- What is a multi-stage build and why does it reduce image size?
+- Why should containers never run as root?
+- What is `.dockerignore` and why does it matter?
+- What is the difference between `CMD` and `ENTRYPOINT`?
+
+---
+
+### Step 1 — The bad Dockerfile (what NOT to do)
+
+Read this, understand why it is wrong, then write the correct version:
+
+```dockerfile
+# ❌ BAD DOCKERFILE — DO NOT USE THIS
+FROM ubuntu:latest          # Latest tag is unpredictable — use a pinned version
+RUN apt-get update
+RUN apt-get install -y python3 pip  # Two separate RUN = two layers, cache unfriendly
+RUN pip install flask redis psycopg2-binary gunicorn  # No version pinning
+COPY . /app                 # Copies everything including .git, __pycache__, secrets
+WORKDIR /app
+ENV DB_PASSWORD=mysecret    # NEVER bake secrets into images
+EXPOSE 5000
+CMD python3 app/main.py     # Runs as root, no signal handling
+```
+
+Problems: unpinned base image, bloated layers, copies secrets, runs as root, no health check, no version pinning on dependencies, no `.dockerignore`.
+
+---
+
+### Step 2 — Create .dockerignore
+
+```bash
+cd ~/nexaops-docker-lab/dashboard
+
+cat > .dockerignore << 'EOF'
+# Git
+.git/
+.gitignore
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Test files
+tests/
+*.test.py
+
+# Development files
+.env
+.env.*
+docker-compose.override.yml
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE files
+.vscode/
+.idea/
+
+# Logs
+*.log
+EOF
+```
+
+---
+
+### Step 3 — Write the production-grade Dockerfile
+
+```bash
+cat > Dockerfile << 'EOF'
+# =============================================================================
+# NexaOps Internal Dashboard — Production Dockerfile
+# Multi-stage build: builder stage installs deps, final stage runs the app
+# =============================================================================
+
+# ── Stage 1: Builder ──────────────────────────────────────────────────────────
+# Install dependencies in a separate stage so build tools
+# don't end up in the final image
+FROM python:3.11-slim AS builder
+
+# Set working directory
+WORKDIR /build
+
+# Install build dependencies (only needed at build time)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    libpq-dev \
+  && rm -rf /var/lib/apt/lists/*
+
+# Copy only requirements first — Docker caches this layer
+# If requirements.txt hasn't changed, pip install is skipped on rebuild
+COPY requirements.txt .
+
+# Install Python dependencies into /install (isolated from system Python)
+RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
+
+
+# ── Stage 2: Final image ──────────────────────────────────────────────────────
+# Start fresh from a clean base — no build tools, no compilers
+FROM python:3.11-slim AS final
+
+# Add image metadata
+LABEL maintainer="NexaOps Platform Team <devops@nexaops.com>"
+LABEL version="1.0.0"
+LABEL description="NexaOps Internal Dashboard"
+LABEL org.opencontainers.image.source="https://github.com/nexaops/dashboard"
+
+# Install only runtime dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libpq5 \
+    curl \
+  && rm -rf /var/lib/apt/lists/*
+
+# Copy installed Python packages from builder stage
+COPY --from=builder /install /usr/local
+
+# Create a non-root user to run the application
+# -r = system user, -g root = primary group root, no home dir needed
+RUN useradd -r -u 1001 -g root -s /bin/false nexaops-app
+
+# Set working directory
+WORKDIR /app
+
+# Copy application code
+# Copying specific directories avoids including unnecessary files
+COPY app/ ./app/
+COPY templates/ ./templates/
+COPY static/ ./static/ 2>/dev/null || true
+
+# Set ownership of app files to the non-root user
+RUN chown -R nexaops-app:root /app \
+  && chmod -R g=u /app
+
+# Switch to non-root user
+USER nexaops-app
+
+# Environment variables with safe defaults
+# Secrets (DB_PASSWORD etc.) are NEVER set here — injected at runtime
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    FLASK_ENV=production \
+    APP_VERSION=1.0.0 \
+    ENVIRONMENT=production \
+    PORT=5000
+
+# Document which port the app uses
+EXPOSE 5000
+
+# Health check — Docker will call this to determine container health
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+  CMD curl -f http://localhost:5000/health || exit 1
+
+# Use ENTRYPOINT for the executable + CMD for default arguments
+# This allows overriding CMD arguments without replacing gunicorn
+ENTRYPOINT ["gunicorn"]
+CMD ["--bind", "0.0.0.0:5000", \
+     "--workers", "2", \
+     "--threads", "2", \
+     "--timeout", "60", \
+     "--access-logfile", "-", \
+     "--error-logfile", "-", \
+     "app.main:app"]
+EOF
+```
+
+---
+
+### Step 4 — Build the image
+
+```bash
+cd ~/nexaops-docker-lab/dashboard
+
+# Build with a tag
+docker build -t nexaops-dashboard:1.0.0 .
+
+# Also tag as latest
+docker tag nexaops-dashboard:1.0.0 nexaops-dashboard:latest
+
+# See the result
+docker images nexaops-dashboard
+
+# Inspect the layers
+docker history nexaops-dashboard:1.0.0
+
+# Verify no secrets in image
+docker inspect nexaops-dashboard:1.0.0 | grep -i password || echo "No passwords found in image metadata"
+```
+
+---
+
+### Step 5 — Run the container
+
+```bash
+# Run the dashboard (Redis and DB unavailable but app still starts)
+docker run -d \
+  --name nexaops-dashboard \
+  -p 5000:5000 \
+  -e ENVIRONMENT=development \
+  -e APP_VERSION=1.0.0 \
+  nexaops-dashboard:1.0.0
+
+# Check it started
+docker ps
+
+# Hit the health endpoint
+curl http://localhost:5000/health
+
+# Hit the dashboard
+curl http://localhost:5000/
+
+# View logs
+docker logs nexaops-dashboard
+
+# Inspect the running container
+docker inspect nexaops-dashboard
+
+# Confirm it is running as non-root
+docker exec nexaops-dashboard whoami
+# Should return: nexaops-app (NOT root)
+
+# Stop and remove
+docker stop nexaops-dashboard
+docker rm nexaops-dashboard
+```
+
+---
+
+### Step 6 — Compare image sizes
+
+```bash
+# See the difference between good and bad base images
+docker pull python:3.11          # Full Python image
+docker pull python:3.11-slim     # Slim variant
+docker pull python:3.11-alpine   # Alpine variant
+
+docker images python --format "table {{.Repository}}\t{{.Tag}}\t{{.Size}}"
+```
+
+The full image is typically 1GB+. The slim variant is around 130MB. Alpine is under 50MB but uses musl libc which can cause subtle compatibility issues with some Python packages — slim is the recommended production choice for Python.
+
+---
+
+### ✅ Task 2 — Answers
+
+**How does each Dockerfile instruction create a layer?**
+Every `RUN`, `COPY`, and `ADD` instruction creates a new read-only layer on top of the previous ones. Layers are cached — if an instruction and everything before it has not changed, Docker uses the cached layer instead of re-executing it. This is why you copy `requirements.txt` and run `pip install` before copying your app code — app code changes frequently, dependencies do not, so the pip install cache is preserved.
+
+**What is a multi-stage build?**
+A Dockerfile with multiple `FROM` statements. Each `FROM` starts a new stage with a fresh filesystem. You can copy specific files from earlier stages using `COPY --from=stage-name`. This lets you use build tools (gcc, npm, Maven) in early stages and produce a clean final image without them — dramatically reducing image size and attack surface.
+
+**Why not run as root?**
+If a vulnerability in the app allows remote code execution, the attacker gets root inside the container. Depending on the container configuration, this can be leveraged to escape to the host. A non-root user limits the blast radius — the attacker can only do what that user can do.
+
+**What is `.dockerignore`?**
+A file that tells Docker what NOT to include when it copies your build context (the directory you pass to `docker build`). Without it, `COPY . .` copies your `.git` folder, Python `__pycache__`, `.env` files, and everything else — bloating the image and potentially leaking secrets.
+
+**`CMD` vs `ENTRYPOINT`?**
+`ENTRYPOINT` sets the executable that always runs — it cannot be overridden without `--entrypoint`. `CMD` provides default arguments to the entrypoint — it CAN be overridden by arguments after the image name in `docker run`. Used together: `ENTRYPOINT ["gunicorn"]` + `CMD ["--workers", "2", "app:app"]` means `docker run myimage --workers 4 app:app` overrides the worker count but keeps gunicorn.
+
+---
+
+## 6. Task 3 — Docker Networking and Volumes
+
+### Scenario
+
+The dashboard needs to talk to Redis and PostgreSQL. These are separate containers — they need a network to communicate. The database also needs persistent storage so data survives container restarts.
+
+### Questions to answer before you look at the steps
+
+- What is a Docker bridge network?
+- How do containers on the same network find each other?
+- What is the difference between a bind mount and a named volume?
+- What happens to data in a container when it is removed?
+
+---
+
+### Step 1 — Explore default networks
+
+```bash
+# List all Docker networks
+docker network ls
+
+# You will see three default networks:
+# bridge  — default network, containers communicate by IP
+# host    — container shares the host's network stack
+# none    — no networking
+
+# Inspect the default bridge network
+docker network inspect bridge
+```
+
+---
+
+### Step 2 — Create a custom bridge network
+
+```bash
+# Create a dedicated network for the NexaOps services
+docker network create \
+  --driver bridge \
+  --subnet 172.20.0.0/16 \
+  --gateway 172.20.0.1 \
+  nexaops-network
+
+# Verify
+docker network ls
+docker network inspect nexaops-network
+```
+
+---
+
+### Step 3 — Run Redis on the network
+
+```bash
+# Run Redis — connected to nexaops-network
+# --network-alias sets the DNS name other containers use to reach this one
+docker run -d \
+  --name nexaops-redis \
+  --network nexaops-network \
+  --network-alias redis \
+  redis:7-alpine \
+  redis-server --appendonly yes
+
+# Verify Redis is running
+docker ps | grep redis
+docker logs nexaops-redis
+
+# Test Redis connectivity
+docker exec nexaops-redis redis-cli ping
+# Should return: PONG
+```
+
+---
+
+### Step 4 — Run PostgreSQL with a named volume
+
+```bash
+# Create a named volume for PostgreSQL data
+docker volume create nexaops-postgres-data
+
+# List volumes
+docker volume ls
+docker volume inspect nexaops-postgres-data
+
+# Run PostgreSQL with the named volume
+docker run -d \
+  --name nexaops-postgres \
+  --network nexaops-network \
+  --network-alias postgres \
+  -e POSTGRES_DB=nexaops \
+  -e POSTGRES_USER=nexaops \
+  -e POSTGRES_PASSWORD=nexaops \
+  -v nexaops-postgres-data:/var/lib/postgresql/data \
+  -v $(pwd)/init.sql:/docker-entrypoint-initdb.d/init.sql:ro \
+  postgres:15-alpine
+
+# Wait 5 seconds for PostgreSQL to initialise
+sleep 5
+
+# Verify PostgreSQL is running
+docker ps | grep postgres
+docker logs nexaops-postgres | tail -5
+
+# Connect and verify the schema was created
+docker exec -it nexaops-postgres psql -U nexaops -d nexaops -c "\dt"
+docker exec -it nexaops-postgres psql -U nexaops -d nexaops -c "SELECT * FROM deployments;"
+```
+
+---
+
+### Step 5 — Run the dashboard on the network
+
+```bash
+docker run -d \
+  --name nexaops-dashboard \
+  --network nexaops-network \
+  -p 5000:5000 \
+  -e REDIS_HOST=redis \
+  -e DB_HOST=postgres \
+  -e DB_NAME=nexaops \
+  -e DB_USER=nexaops \
+  -e DB_PASSWORD=nexaops \
+  -e ENVIRONMENT=development \
+  nexaops-dashboard:1.0.0
+
+# Check all three containers are running
+docker ps
+
+# Test the full stack
+curl http://localhost:5000/health
+curl http://localhost:5000/api/services
+curl http://localhost:5000/api/deployments
+```
+
+Notice: the dashboard connects to Redis using the hostname `redis` and to PostgreSQL using `postgres` — not IP addresses. Docker's built-in DNS resolves container names and network aliases on a custom network.
+
+---
+
+### Step 6 — Prove volumes persist
+
+```bash
+# Add data to PostgreSQL
+docker exec -it nexaops-postgres psql -U nexaops -d nexaops \
+  -c "INSERT INTO deployments (service, version, status, deployed_by) VALUES ('test-service', '9.9.9', 'success', 'engineer-a');"
+
+# Verify the data is there
+docker exec -it nexaops-postgres psql -U nexaops -d nexaops \
+  -c "SELECT * FROM deployments WHERE service='test-service';"
+
+# Remove the PostgreSQL container
+docker stop nexaops-postgres
+docker rm nexaops-postgres
+
+# Recreate the container from the same volume
+docker run -d \
+  --name nexaops-postgres \
+  --network nexaops-network \
+  --network-alias postgres \
+  -e POSTGRES_DB=nexaops \
+  -e POSTGRES_USER=nexaops \
+  -e POSTGRES_PASSWORD=nexaops \
+  -v nexaops-postgres-data:/var/lib/postgresql/data \
+  postgres:15-alpine
+
+sleep 5
+
+# The data is still there — volumes outlive containers
+docker exec -it nexaops-postgres psql -U nexaops -d nexaops \
+  -c "SELECT * FROM deployments WHERE service='test-service';"
+```
+
+---
+
+### Step 7 — Bind mounts for development
+
+Named volumes are for production data. Bind mounts are for development — they mount a host directory directly into the container so changes to your code are reflected instantly without rebuilding.
+
+```bash
+# Stop the dashboard
+docker stop nexaops-dashboard && docker rm nexaops-dashboard
+
+# Run with a bind mount on the templates directory
+docker run -d \
+  --name nexaops-dashboard \
+  --network nexaops-network \
+  -p 5000:5000 \
+  -e REDIS_HOST=redis \
+  -e DB_HOST=postgres \
+  -e DB_NAME=nexaops \
+  -e DB_USER=nexaops \
+  -e DB_PASSWORD=nexaops \
+  -e ENVIRONMENT=development \
+  -v $(pwd)/templates:/app/templates:ro \
+  nexaops-dashboard:1.0.0
+
+# Now edit templates/index.html on your host
+# The change is reflected in the running container immediately
+# (after a page refresh — no rebuild needed)
+```
+
+---
+
+### Step 8 — Clean up networking lab
+
+```bash
+docker stop nexaops-dashboard nexaops-redis nexaops-postgres
+docker rm nexaops-dashboard nexaops-redis nexaops-postgres
+docker network rm nexaops-network
+# Keep the volume for Task 4
+```
+
+---
+
+### ✅ Task 3 — Answers
+
+**What is a Docker bridge network?**
+A private internal network created by Docker on the host. Containers attached to the same bridge network can communicate with each other using container names as hostnames. The bridge is isolated from the host network — external traffic can only reach containers via published ports (`-p`). The default bridge network does not support DNS by name — only custom bridge networks do.
+
+**How do containers find each other on a network?**
+Docker runs an embedded DNS server. On a custom bridge network, every container's name and any `--network-alias` values are registered in DNS. When `nexaops-dashboard` resolves `redis`, Docker DNS returns the IP of the `nexaops-redis` container. This is why you use `REDIS_HOST=redis` — not an IP address which could change.
+
+**Bind mount vs named volume?**
+A bind mount maps a specific host filesystem path into the container — great for development because you see code changes immediately. A named volume is managed entirely by Docker — the data is stored in Docker's storage area (`/var/lib/docker/volumes/`) and persists independently of any container. Named volumes are for production data; bind mounts are for development workflows.
+
+**What happens to data when a container is removed?**
+Anything written inside the container's writable layer is permanently gone when the container is removed. Data in a bind mount survives — it is on the host filesystem. Data in a named volume survives — Docker keeps it until you explicitly delete the volume with `docker volume rm`. This is why databases must always use volumes.
+
+---
+
+## 7. Task 4 — Docker Compose: Multi-container Application
+
+### Scenario
+
+Running three `docker run` commands in the right order, with the right flags, remembering every environment variable — this is not sustainable. Docker Compose lets you define the entire stack in one file and bring it up with a single command.
+
+### Questions to answer before you look at the steps
+
+- What problem does Docker Compose solve over individual `docker run` commands?
+- What is a `docker-compose.yml` service vs a container?
+- What does `depends_on` do and what does it NOT do?
+- What is the difference between `docker compose up` and `docker compose up --build`?
+
+---
+
+### Step 1 — Create docker-compose.yml
+
+```bash
+cd ~/nexaops-docker-lab/dashboard
+
+cat > docker-compose.yml << 'EOF'
+# =============================================================================
+# NexaOps Dashboard — Docker Compose Stack
+# Services: dashboard (Flask), redis (cache), postgres (database)
+# =============================================================================
+
+version: "3.9"
+
+services:
+
+  # ── Dashboard ──────────────────────────────────────────────────────────────
+  dashboard:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: final
+    image: nexaops-dashboard:1.0.0
+    container_name: nexaops-dashboard
+    ports:
+      - "5000:5000"
+    environment:
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: nexaops
+      DB_USER: nexaops
+      DB_PASSWORD: ${DB_PASSWORD:-nexaops}
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+      APP_VERSION: "1.0.0"
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    networks:
+      - nexaops-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  # ── Redis ──────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: nexaops-redis
+    command: redis-server --appendonly yes --maxmemory 128mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis-data:/data
+    networks:
+      - nexaops-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  # ── PostgreSQL ─────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:15-alpine
+    container_name: nexaops-postgres
+    environment:
+      POSTGRES_DB: nexaops
+      POSTGRES_USER: nexaops
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-nexaops}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    networks:
+      - nexaops-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nexaops -d nexaops"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+# ── Volumes ────────────────────────────────────────────────────────────────
+volumes:
+  postgres-data:
+    name: nexaops-postgres-data
+  redis-data:
+    name: nexaops-redis-data
+
+# ── Networks ───────────────────────────────────────────────────────────────
+networks:
+  nexaops-network:
+    name: nexaops-network
+    driver: bridge
+EOF
+```
+
+---
+
+### Step 2 — Create a .env file for local development
+
+```bash
+cat > .env << 'EOF'
+# NexaOps Dashboard — local development environment
+# This file is gitignored — never commit real secrets
+DB_PASSWORD=nexaops
+ENVIRONMENT=development
+EOF
+```
+
+Add to `.dockerignore` and `.gitignore`:
+
+```bash
+echo ".env" >> .dockerignore
+echo ".env" >> ../.gitignore
+```
+
+---
+
+### Step 3 — Start the full stack
+
+```bash
+cd ~/nexaops-docker-lab/dashboard
+
+# Start all services (builds the image if not already built)
+docker compose up -d
+
+# Watch the startup sequence
+docker compose logs -f
+
+# Check the status of all services
+docker compose ps
+
+# All three should show status: healthy
+```
+
+---
+
+### Step 4 — Test the full stack
+
+```bash
+# Wait for all health checks to pass
+sleep 20
+
+# Dashboard health check (shows redis and db connectivity)
+curl http://localhost:5000/health
+
+# Get services from API (served from Redis cache after first call)
+curl http://localhost:5000/api/services | python3 -m json.tool
+
+# Get deployments from PostgreSQL
+curl http://localhost:5000/api/deployments | python3 -m json.tool
+
+# Open in browser (if running locally)
+# http://localhost:5000
+```
+
+---
+
+### Step 5 — Useful Compose commands
+
+```bash
+# View logs for one service
+docker compose logs dashboard
+docker compose logs postgres -f
+
+# Scale the dashboard (run 2 instances)
+# Note: port conflicts need resolution for multiple replicas
+docker compose up -d --scale dashboard=1
+
+# Restart one service
+docker compose restart dashboard
+
+# Execute a command in a running service
+docker compose exec postgres psql -U nexaops -d nexaops -c "\dt"
+docker compose exec redis redis-cli info memory
+
+# Pull latest images
+docker compose pull
+
+# Stop all services (containers stop, volumes preserved)
+docker compose stop
+
+# Start again
+docker compose start
+
+# Remove containers and networks (volumes preserved)
+docker compose down
+
+# Remove everything including volumes (destroys all data)
+docker compose down -v
+
+# Rebuild and restart
+docker compose up -d --build
+```
+
+---
+
+### Step 6 — Override for production
+
+Create a production override file:
+
+```bash
+cat > docker-compose.prod.yml << 'EOF'
+# Production overrides — used with:
+# docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+
+version: "3.9"
+
+services:
+  dashboard:
+    environment:
+      ENVIRONMENT: production
+    restart: always
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  redis:
+    restart: always
+
+  postgres:
+    restart: always
+EOF
+```
+
+```bash
+# Run with production overrides
+docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+docker compose ps
+docker compose down
+```
+
+---
+
+### ✅ Task 4 — Answers
+
+**What problem does Compose solve?**
+Managing multiple containers manually is error-prone — wrong startup order, forgotten environment variables, missing network flags. Compose defines the entire stack as code in one file. `docker compose up -d` brings everything up correctly every time. It is self-documenting — the file shows exactly how the stack is configured.
+
+**Service vs container?**
+A service in Compose is the definition — the blueprint describing what image to use, what environment variables to set, what ports to expose. A container is the running instance of that service. One service can run multiple container instances (scaling).
+
+**What does `depends_on` do and NOT do?**
+`depends_on` controls startup order — Compose starts dependent services first. With `condition: service_healthy`, it waits until the health check passes before starting the dependent service. It does NOT wait for the application inside the container to be fully ready — only for the container to be running (without the condition). Always use health checks with `depends_on` for database and cache services.
+
+**`docker compose up` vs `docker compose up --build`?**
+Without `--build`, Compose uses the existing image if it exists — even if your Dockerfile changed. With `--build`, Compose rebuilds the image from the Dockerfile before starting. Always use `--build` after changing the Dockerfile or dependencies.
+
+---
+
+## 8. Task 5 — Ship to Production: EC2 Deployment
+
+### Scenario
+
+The dashboard runs perfectly on your laptop. Now prove the container is truly portable — push the image to Docker Hub, spin up a fresh EC2 instance with nothing on it, pull the image, and run the full stack. The application must behave identically on the server.
+
+### Questions to answer before you look at the steps
+
+- What is the sequence from local build to production deployment?
+- What is the difference between `docker push` and deploying to a server?
+- Why do we push to Docker Hub rather than copying files to the server?
+- What is image tagging strategy in production?
+
+---
+
+### Step 1 — Tag and push to Docker Hub
+
+```bash
+cd ~/nexaops-docker-lab/dashboard
+
+# Login to Docker Hub
+docker login
+
+# Tag the image with your Docker Hub username
+# Format: docker.io/<username>/<image>:<tag>
+DOCKERHUB_USERNAME=<YOUR_DOCKERHUB_USERNAME>
+
+docker tag nexaops-dashboard:1.0.0 \
+  ${DOCKERHUB_USERNAME}/nexaops-dashboard:1.0.0
+
+docker tag nexaops-dashboard:1.0.0 \
+  ${DOCKERHUB_USERNAME}/nexaops-dashboard:latest
+
+# Push both tags
+docker push ${DOCKERHUB_USERNAME}/nexaops-dashboard:1.0.0
+docker push ${DOCKERHUB_USERNAME}/nexaops-dashboard:latest
+
+# Verify on Docker Hub — go to hub.docker.com and check your repos
+echo "Image available at: docker.io/${DOCKERHUB_USERNAME}/nexaops-dashboard:1.0.0"
+```
+
+---
+
+### Step 2 — Launch an EC2 instance
+
+Launch a t3.micro Ubuntu 22.04 instance using what you learned in Module 5.
+
+Security group inbound rules:
+
+| Type | Port | Source |
+|---|---|---|
+| SSH | 22 | My IP |
+| Custom TCP | 5000 | My IP (dashboard) |
+| Custom TCP | 5432 | My IP (postgres — for verification only) |
+
+```bash
+# From your local machine — get the EC2 public IP from console
+EC2_IP=<YOUR_EC2_PUBLIC_IP>
+
+# SSH in
+ssh -i ~/.ssh/nexaops-ec2-key.pem ubuntu@${EC2_IP}
+```
+
+---
+
+### Step 3 — Set up the EC2 instance
+
+```bash
+# On the EC2 instance — install Docker
+curl -fsSL https://get.docker.com | sudo sh
+sudo usermod -aG docker ubuntu
+newgrp docker
+
+# Install Docker Compose
+sudo apt-get install -y docker-compose-plugin
+
+# Verify
+docker --version
+docker compose version
+
+# Create the app directory
+mkdir -p ~/nexaops-dashboard
+cd ~/nexaops-dashboard
+```
+
+---
+
+### Step 4 — Deploy using docker-compose.yml on EC2
+
+```bash
+# On the EC2 instance — create a production docker-compose.yml
+# (We pull the pre-built image from Docker Hub — no source code needed on the server)
+
+DOCKERHUB_USERNAME=<YOUR_DOCKERHUB_USERNAME>
+
+cat > docker-compose.yml << EOF
+version: "3.9"
+
+services:
+
+  dashboard:
+    image: ${DOCKERHUB_USERNAME}/nexaops-dashboard:1.0.0
+    container_name: nexaops-dashboard
+    ports:
+      - "5000:5000"
+    environment:
+      REDIS_HOST: redis
+      DB_HOST: postgres
+      DB_NAME: nexaops
+      DB_USER: nexaops
+      DB_PASSWORD: \${DB_PASSWORD}
+      ENVIRONMENT: production
+      APP_VERSION: "1.0.0"
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    networks:
+      - nexaops-network
+    restart: always
+
+  redis:
+    image: redis:7-alpine
+    container_name: nexaops-redis
+    command: redis-server --appendonly yes
+    volumes:
+      - redis-data:/data
+    networks:
+      - nexaops-network
+    restart: always
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  postgres:
+    image: postgres:15-alpine
+    container_name: nexaops-postgres
+    environment:
+      POSTGRES_DB: nexaops
+      POSTGRES_USER: nexaops
+      POSTGRES_PASSWORD: \${DB_PASSWORD}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      - nexaops-network
+    restart: always
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nexaops -d nexaops"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+volumes:
+  postgres-data:
+  redis-data:
+
+networks:
+  nexaops-network:
+    driver: bridge
+EOF
+
+# Create .env with production values
+cat > .env << 'EOF'
+DB_PASSWORD=NexaOps@Pr0d2024
+EOF
+
+chmod 600 .env
+```
+
+---
+
+### Step 5 — Pull and run on EC2
+
+```bash
+# Pull all images
+docker compose pull
+
+# Start the stack
+docker compose up -d
+
+# Monitor startup
+docker compose logs -f
+
+# Wait for health checks
+sleep 20
+docker compose ps
+```
+
+---
+
+### Step 6 — Verify identical behaviour
+
+```bash
+# On EC2 — test the same endpoints as local
+curl http://localhost:5000/health
+curl http://localhost:5000/api/services
+curl http://localhost:5000/api/deployments
+
+# From your local machine — test via public IP
+curl http://${EC2_IP}:5000/health
+```
+
+You are running the exact same Docker image as locally. Same Python version, same dependencies, same application code — just different environment variables. This is the promise of containers: **build once, run anywhere.**
+
+---
+
+### Step 7 — Simulate a new release
+
+```bash
+# On your LOCAL machine — make a change to the app
+# Edit templates/index.html — change the footer text to:
+# "NexaOps Ltd — Production v1.1.0"
+
+# Bump the version and rebuild
+docker build -t nexaops-dashboard:1.1.0 .
+docker tag nexaops-dashboard:1.1.0 ${DOCKERHUB_USERNAME}/nexaops-dashboard:1.1.0
+docker tag nexaops-dashboard:1.1.0 ${DOCKERHUB_USERNAME}/nexaops-dashboard:latest
+docker push ${DOCKERHUB_USERNAME}/nexaops-dashboard:1.1.0
+docker push ${DOCKERHUB_USERNAME}/nexaops-dashboard:latest
+
+# On EC2 — deploy the new version
+# Update the image tag in docker-compose.yml to 1.1.0, then:
+docker compose pull dashboard
+docker compose up -d dashboard
+
+# Zero-downtime: Compose pulls the new image and replaces the container
+curl http://localhost:5000/health
+# Verify the new version is running
+```
+
+---
+
+### ✅ Task 5 — Answers
+
+**Sequence from local build to production?**
+Build image locally (`docker build`) → tag with registry path (`docker tag`) → push to registry (`docker push`) → on production server: pull image (`docker pull` or `docker compose pull`) → run container (`docker compose up -d`). The image is the immutable artifact that travels from dev to production.
+
+**`docker push` vs deploying to a server?**
+`docker push` uploads the image to a registry. Deploying is pulling that image on the server and running it. The registry is the middle layer — it decouples building (your laptop or CI) from running (the server). You never copy source code, ZIP files, or JAR files to the server — just an image tag.
+
+**Why Docker Hub rather than copying files?**
+Copying files requires SSH access, handling dependencies, environment setup, and hoping the server has the right runtime. A registry means the server only needs Docker installed — `docker pull` handles everything else. In CI/CD (Module 8), the pipeline pushes the image; the server pulls it — no direct connection between CI and the server needed.
+
+**Image tagging strategy?**
+Never rely on `latest` in production — it is ambiguous. Use semantic versions (`1.0.0`, `1.1.0`) so you know exactly what is running and can roll back by deploying the previous tag. Common strategies: `v1.0.0` for releases, `v1.0.0-rc1` for release candidates, `sha-abc1234` (git commit hash) in CI/CD for exact traceability.
+
+---
+
+## 9. Document your work — commands.md
+
+```markdown
+# NexaOps Docker Lab — Commands Reference
+## NXOPS-007 | Module 7: Containers with Docker
+
+---
+
+## Docker fundamentals
+
+| Command | What it does |
+|---|---|
+| `docker version` | Show client and daemon versions |
+| `docker info` | Show daemon configuration and system info |
+| `docker pull image:tag` | Download an image from a registry |
+| `docker images` | List local images |
+| `docker inspect image` | Show full image metadata |
+| `docker history image` | Show image layers |
+| `docker run -it image bash` | Run container interactively |
+| `docker run -d --name X -p H:C image` | Run container in background |
+| `docker ps` | List running containers |
+| `docker ps -a` | List all containers including stopped |
+| `docker logs container` | Show container logs |
+| `docker logs -f container` | Follow container logs |
+| `docker exec -it container sh` | Open shell in running container |
+| `docker stop container` | Stop a container (SIGTERM) |
+| `docker rm container` | Remove a stopped container |
+| `docker rm -f container` | Force remove a running container |
+| `docker system prune` | Remove all unused resources |
+| `docker system df` | Show Docker disk usage |
+
+## Building images
+
+| Command | What it does |
+|---|---|
+| `docker build -t name:tag .` | Build image from Dockerfile in current directory |
+| `docker build --no-cache -t name:tag .` | Build without using layer cache |
+| `docker tag source:tag target:tag` | Create a new tag for an existing image |
+| `docker rmi image:tag` | Remove a local image |
+
+## Networking
+
+| Command | What it does |
+|---|---|
+| `docker network ls` | List all networks |
+| `docker network create --driver bridge name` | Create a bridge network |
+| `docker network inspect name` | Show network details |
+| `docker network rm name` | Remove a network |
+
+## Volumes
+
+| Command | What it does |
+|---|---|
+| `docker volume create name` | Create a named volume |
+| `docker volume ls` | List volumes |
+| `docker volume inspect name` | Show volume details |
+| `docker volume rm name` | Remove a volume |
+| `docker volume prune` | Remove all unused volumes |
+
+## Docker Compose
+
+| Command | What it does |
+|---|---|
+| `docker compose up -d` | Start all services in background |
+| `docker compose up -d --build` | Rebuild images then start |
+| `docker compose down` | Stop and remove containers and networks |
+| `docker compose down -v` | Also remove volumes |
+| `docker compose ps` | Show status of all services |
+| `docker compose logs service` | Show logs for a service |
+| `docker compose logs -f` | Follow all logs |
+| `docker compose exec service cmd` | Run command in a service |
+| `docker compose pull` | Pull latest images |
+| `docker compose restart service` | Restart one service |
+| `docker compose stop` | Stop all services |
+| `docker compose start` | Start stopped services |
+
+## Docker Hub
+
+| Command | What it does |
+|---|---|
+| `docker login` | Authenticate with Docker Hub |
+| `docker push username/image:tag` | Push image to Docker Hub |
+| `docker pull username/image:tag` | Pull image from Docker Hub |
+| `docker logout` | Log out of registry |
+```
+
+---
+
+## 10. Push to GitHub
+
+```bash
+cd ~/nexaops-docker-lab
+
+cat > .gitignore << 'EOF'
+# Environment files — never commit secrets
+.env
+.env.*
+docker-compose.override.yml
+
+# Python cache
+__pycache__/
+*.pyc
+
+# OS files
+.DS_Store
+Thumbs.db
+EOF
+
+git add .
+git commit -m "feat(dashboard): add NexaOps dashboard Docker lab
+
+- app/main.py: Flask dashboard with Redis cache and PostgreSQL
+- templates/index.html: dark theme service status dashboard
+- Dockerfile: multi-stage production build, non-root user
+- docker-compose.yml: three-service stack with health checks
+- init.sql: PostgreSQL schema and seed data
+- commands.md: complete Docker command reference
+Ticket: NXOPS-007"
+
+git remote add origin https://github.com/<YOUR_USERNAME>/nexaops-docker-lab.git
+git branch -M main
+git push -u origin main
+```
+
+---
+
+## 11. Acceptance criteria checklist
+
+- [ ] `docker run hello-world` works on both WSL and EC2
+- [ ] `nexaops-dashboard:1.0.0` image built with multi-stage Dockerfile
+- [ ] Container runs as `nexaops-app` user — confirmed with `docker exec container whoami`
+- [ ] No secrets in image metadata — confirmed with `docker inspect`
+- [ ] Health check passes — `curl http://localhost:5000/health` returns 200
+- [ ] All three services running on `nexaops-network` with DNS resolution between them
+- [ ] PostgreSQL data persists after container removal — demonstrated in Task 3 Step 6
+- [ ] `docker compose up -d` starts the full stack from one command
+- [ ] `depends_on` with health checks — dashboard waits for Redis and PostgreSQL
+- [ ] Image pushed to Docker Hub and visible at `hub.docker.com/<username>/nexaops-dashboard`
+- [ ] Full stack running on EC2 — confirmed with `curl http://<EC2_IP>:5000/health`
+- [ ] Version 1.1.0 deployed to EC2 without SSH-ing in to touch source code
+- [ ] `commands.md` documents all commands with explanations
+- [ ] GitHub repo `nexaops-docker-lab` public with meaningful commit history
+
+---
+
+## 12. Tear-down Checklist
+
+```bash
+# Local WSL — clean up
+docker compose down -v
+docker rmi nexaops-dashboard:1.0.0 nexaops-dashboard:1.1.0 nexaops-dashboard:latest
+docker system prune -f
+
+# EC2 — SSH in and clean up
+docker compose down -v
+docker system prune -af
+
+# Then terminate the EC2 instance from AWS console
+# EC2 → Instances → nexaops-docker-server → Terminate
+```
+
+---
+
+## 13. LinkedIn Post Template
+
+> For **Engineer A (lead rotation)**. Personalise before posting.
+
+```
+Week 7 of our DevOps bootcamp — containers finally clicked for me this week.
+
+"It works on my machine" is not a deployment strategy.
+
+This week I built and containerised the NexaOps Internal Dashboard —
+a three-tier Flask application with Redis caching and PostgreSQL storage.
+
+What I built:
+🐳 Multi-stage Dockerfile — builder stage compiles deps, final stage runs
+   the app. Image size went from ~1.1GB to ~180MB.
+
+🔐 Security-first container — app runs as a non-root user (nexaops-app),
+   no secrets baked into the image, .dockerignore excludes sensitive files.
+
+🌐 Docker networking — custom bridge network with DNS resolution between
+   containers. dashboard talks to redis and postgres by name, not IP.
+
+💾 Volume persistence — proved PostgreSQL data survives container removal
+   and recreation using named volumes.
+
+📦 Docker Compose — the entire three-service stack starts with one command:
+   docker compose up -d (with health checks and proper startup ordering)
+
+🚀 Production deploy — pushed the image to Docker Hub, pulled it on a fresh
+   EC2 instance with nothing installed except Docker, and ran the identical
+   stack. Same behaviour, zero environment setup.
+
+The same image running locally ran on EC2 without a single change to the code.
+That's the point of containers.
+
+Repo + screenshots in comments.
+
+[tag your 2 teammates]
+#Docker #Containers #DevOps #CloudEngineering #Flask #AWS
+#LearningInPublic #100DaysOfDevOps
+```
+
+---
+
+## 14. Interview Questions — 5 Scenario-based Questions
+
+### Q1 — Docker fundamentals (very common)
+
+**Scenario:** An interviewer asks you to explain the difference between a Docker image and a container as if you were explaining it to a developer who has never used Docker.
+
+Sub-questions:
+- What is a Docker image made of?
+- What happens when you `docker run` an image?
+- What is a container registry and name two examples?
+
+**Bonus:** If you run `docker run ubuntu` twice, do you get one container or two? What if you run `docker run --name mybox ubuntu` twice?
+
+<details>
+<summary>Reveal answer</summary>
+
+An image is a read-only layered filesystem packaged with metadata — think of it as a blueprint or a class in OOP. It contains the OS files, your application code, and all dependencies, frozen at build time. A container is a running instance of that blueprint — like an object instantiated from a class. It adds a thin writable layer on top of the image layers.
+
+`docker run` creates a new container from the image and starts the default process. If the image is not local, Docker pulls it from the registry first.
+
+A registry is a server that stores and distributes images. Docker Hub (`docker.io`) is the default public registry. Others: AWS ECR, GitHub Container Registry (`ghcr.io`), Google Artifact Registry.
+
+`docker run ubuntu` twice creates two separate containers — each gets its own writable layer and container ID. `docker run --name mybox ubuntu` twice throws an error on the second run: `Error: container name "mybox" is already in use`. Names must be unique among all containers (including stopped ones).
+</details>
+
+---
+
+### Q2 — Dockerfile best practices (very common)
+
+**Scenario:** A senior engineer reviews your Dockerfile and says "this will cause cache misses on every build and the image is too large." What are they likely referring to?
+
+Sub-questions:
+- Why does instruction order matter in a Dockerfile?
+- What is a multi-stage build and what problem does it solve?
+- Name three things that should always be in `.dockerignore`.
+
+**Bonus:** What is the difference between `RUN apt-get update` on one line and `RUN apt-get update && apt-get install -y package` on one line?
+
+<details>
+<summary>Reveal answer</summary>
+
+Layer caching means Docker reuses cached layers until it finds a change. If you `COPY . .` before `pip install`, every code change (even a comment) invalidates the pip install cache and forces a full reinstall. Correct order: copy requirements first, install, then copy application code — the slow install step is only re-run when dependencies actually change.
+
+Multi-stage builds use multiple `FROM` statements. Early stages install build tools (gcc, Maven, npm) and compile the app. The final stage starts from a clean base and only copies the compiled output — no build tools in the final image. Result: smaller image, smaller attack surface.
+
+`.dockerignore` should always exclude: `.git/` (version control history not needed), `.env` files (secrets), and `node_modules/` or `__pycache__/` (regenerated during build).
+
+Two separate `RUN` lines create two layers. `RUN apt-get update` on its own is dangerous — if cached, a later build might run `apt-get install` against a stale package list, installing outdated versions. Always chain `update && install` in one `RUN` statement, and clean up with `rm -rf /var/lib/apt/lists/*` to reduce layer size.
+</details>
+
+---
+
+### Q3 — Networking (common)
+
+**Scenario:** You have two containers — a web app and a database. The web app cannot connect to the database using the hostname `postgres`. What do you check?
+
+Sub-questions:
+- What is required for container DNS resolution by name to work?
+- What is the difference between the default bridge network and a custom bridge network?
+- How do you verify which network a container is on?
+
+**Bonus:** A container needs to be reachable from the internet on port 80 but internally listens on port 8080. What is the `docker run` flag and what does it do?
+
+<details>
+<summary>Reveal answer</summary>
+
+DNS resolution by container name only works on custom bridge networks — not the default bridge. Both containers must be on the same custom network. Check: `docker network inspect nexaops-network` — look for both container names in the Containers section.
+
+Default bridge: containers communicate by IP address only, no DNS. Containers are isolated from each other unless explicitly linked (legacy). Custom bridge: automatic DNS resolution by container name, better isolation, containers can be connected/disconnected at runtime.
+
+Verify network: `docker inspect <container> --format '{{json .NetworkSettings.Networks}}'` or `docker network inspect <network>`.
+
+`-p 80:8080` — maps host port 80 to container port 8080. Traffic arriving at the host on port 80 is forwarded to port 8080 inside the container. Format is always `HOST:CONTAINER`.
+</details>
+
+---
+
+### Q4 — Docker Compose (very common for DevOps roles)
+
+**Scenario:** A developer says "I just run `docker run` three times in my script — why do I need Docker Compose?"
+
+Sub-questions:
+- Name three advantages of Docker Compose over multiple `docker run` commands.
+- What does `depends_on` with `condition: service_healthy` do?
+- What is the difference between `docker compose down` and `docker compose down -v`?
+
+**Bonus:** How do you run the same `docker-compose.yml` with different configuration for dev vs production?
+
+<details>
+<summary>Reveal answer</summary>
+
+Three advantages: (1) single command brings up the entire stack correctly every time — no remembering flags and order, (2) the YAML file is self-documenting and version-controlled — the whole team uses the same config, (3) built-in networking — all services on the same network by default with DNS.
+
+`depends_on` with `condition: service_healthy` makes Compose wait for the health check defined on the dependency to pass before starting the dependent service. Without the condition, Compose only waits for the container to start — not for the database inside it to be ready to accept connections.
+
+`docker compose down` stops and removes containers and networks but leaves volumes intact — data is preserved. `docker compose down -v` also removes all volumes — destroys all persistent data. Never run `-v` in production unless you intend to wipe the database.
+
+Override files: `docker-compose.yml` is the base config. `docker-compose.prod.yml` overrides specific values. Run with: `docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d`. Common pattern: base file defines services, override files change environment variables, resource limits, and restart policies per environment.
+</details>
+
+---
+
+### Q5 — Production deployment (common for DevOps roles)
+
+**Scenario:** Your team wants to deploy a new version of the dashboard to production. A junior engineer suggests SSH-ing into the server, pulling the repo, and running the app directly. What is wrong with this and what is the correct approach?
+
+Sub-questions:
+- Why should application code never be deployed directly to production servers?
+- What is the sequence from code change to running container in production?
+- What is an image tag strategy for production deployments?
+
+**Bonus:** The new deployment is broken. How do you roll back to the previous version in under 30 seconds?
+
+<details>
+<summary>Reveal answer</summary>
+
+Deploying code directly: creates environment drift (what if the server has a different Python version?), requires managing dependencies on the server, makes rollback complicated (which commit was running?), and cannot be reproduced reliably. The same code behaves differently on different servers.
+
+Correct sequence: developer pushes code → CI pipeline runs tests → CI builds Docker image and tags it with version or commit hash → CI pushes image to registry → deployment updates docker-compose.yml image tag → `docker compose pull && docker compose up -d` on the server → old container replaced by new one.
+
+Tagging strategy: use semantic versions (`v1.2.0`) for releases. Use git commit SHA (`sha-abc1234`) for every CI build — this makes every build traceable to exact code. Tag `latest` only on stable releases. Never deploy `latest` to production — the tag is ambiguous.
+
+Rollback in under 30 seconds: `docker compose` with the previous version tag. Update `image: username/dashboard:1.0.0` in docker-compose.yml (or pass `TAG=1.0.0` as env var) and run `docker compose up -d dashboard`. Docker pulls the previous image (likely already cached) and replaces the container. Total time: under 30 seconds if the image is cached.
+</details>
+
+---
+
+## 15. Troubleshooting
+
+**`Got permission denied while trying to connect to the Docker daemon`**
+Your user is not in the docker group. Run `sudo usermod -aG docker $USER` then `newgrp docker` or log out and back in. Verify with `groups`.
+
+**`docker compose up` exits immediately with `unhealthy`**
+One of your services failed its health check. Run `docker compose logs postgres` (or whichever service) to see the error. Common cause: PostgreSQL not fully initialised before the health check fires — increase `start_period` in the health check config.
+
+**`port is already allocated` when starting a container**
+Something else is using that port on your host. Find it: `sudo netstat -tlnp | grep 5000`. Either stop that process or change the host port mapping in docker-compose.yml.
+
+**Container starts but app is unreachable**
+Check in this order: (1) `docker ps` — is the container running? (2) `docker logs container` — any error on startup? (3) is the port published? (`docker inspect container | grep Ports`) (4) security group — is the port open in AWS?
+
+**`docker: Error response from daemon: pull access denied`**
+The image is private or does not exist. Check the image name and tag. If it is yours on Docker Hub, run `docker login` first.
+
+**Flask app starts but shows "Service Unavailable" for Redis/PostgreSQL**
+The app starts without Redis/PostgreSQL — it falls back to default data. Verify both containers are running on the same network: `docker network inspect nexaops-network`. The dashboard should show Redis and PostgreSQL as "connected" in the `/health` response.
+
+**`exec format error` when running on EC2**
+You built the image on an ARM Mac (Apple Silicon) and are running on x86 EC2. Build for the correct platform: `docker buildx build --platform linux/amd64 -t image:tag .`
+
+**`docker compose down -v` deleted my database**
+The `-v` flag removes all volumes. For production, never use `-v`. To preserve data: `docker compose down` (no `-v`), back up volumes before any destructive operation: `docker run --rm -v nexaops-postgres-data:/data -v $(pwd):/backup ubuntu tar czf /backup/postgres-backup.tar.gz /data`
+
+---
+
+## 16. What you learned
+
+By completing this lab you have practised:
+
+- **Docker architecture** — daemon, client, registry, images, containers, layers
+- **Container lifecycle** — pull, run, stop, start, exec, remove, prune
+- **Ephemeral containers** — understanding why data must not live in containers
+- **Dockerfile best practices** — multi-stage builds, layer caching, non-root users, `.dockerignore`, health checks
+- **Image optimisation** — choosing the right base image, minimising layers, reducing attack surface
+- **Docker networking** — custom bridge networks, container DNS resolution, port publishing
+- **Docker volumes** — named volumes for persistence, bind mounts for development, proving data survives container removal
+- **Docker Compose** — defining multi-service stacks as code, health checks, `depends_on`, environment variables, override files
+- **Docker Hub** — tagging strategy, pushing, pulling, versioning images
+- **Production deployment** — build once, push to registry, pull on server, run identically
+- **Rolling updates** — deploying new versions and rolling back without touching source code on the server
+
+---
+
+## Ticket reference
+
+| Field | Value |
+|---|---|
+| Ticket ID | NXOPS-007 |
+| Module | M7 — Containers with Docker |
+| Phase | 2 — Core DevOps |
+| Assignee (lead) | Engineer A |
+| Reviewers | Engineers B & C |
+| Estimate | 10–12 hours |
+| Local environment | WSL2 Ubuntu 22.04 |
+| Cloud environment | EC2 t3.micro Ubuntu 22.04 |
+| Prerequisite | NXOPS-005 (AWS basics for EC2 setup) |
+| Next module | NXOPS-008 — CI/CD with GitHub Actions |
+
+---
+
+*NexaOps DevOps Bootcamp · Built with [Tech World with Nana](https://www.techworld-with-nana.com/) · Facilitated by Claude*
